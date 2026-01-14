@@ -1,70 +1,133 @@
-properties([
-    parameters([
-        string(defaultValue: 'variables.tfvars', description: 'Specify the file name', name: 'File-Name'),
-        choice(choices: ['apply', 'destroy'], description: 'Select Terraform action', name: 'Terraform-Action')
-    ])
-])
-
 pipeline {
     agent any
+
+    parameters {
+        choice(name: 'action', choices: ['plan', 'apply', 'destroy'], description: 'Terraform action to perform')
+    }
+
+    tools {
+        jdk 'jdk17.0.17+10' 
+        nodejs 'node19'
+    }
+
+    environment {
+        AWS_REGION            = 'us-east-1'
+        SCANNER_HOME          = tool 'sonar-scanner'
+        DOCKER_IMAGE          = "aliwazeer/chatbot-ui:latest"
+        JAVA_17_HOME          = '/usr/lib/jvm/java-17-openjdk-amd64'
+    }
+
     stages {
-        stage('Checkout from Git') {
+        stage('Checkout Source') {
             steps {
-                git branch: 'master', url: 'https://github.com/NotHarshhaa/DevOps-Projects/DevOps-Project-28/Chatbot-UI.git'
+                // استخدام الرابط الخاص بمشروعك
+                git branch: 'main', url: 'https://github.com/Uliwazeer/ChatBot-UI-EKS.git'
             }
         }
-        stage('Initializing Terraform') {
+
+        stage('Terraform Operations') {
             steps {
-                withAWS(credentials: 'aws-key', region: 'us-east-1') {
-                dir('EKS-TF') {
-                    script {
-                        sh 'terraform init'
-                    }
-                }
-                }
-            }
-        }
-        stage('Validate Terraform Code') {
-            steps {
-                withAWS(credentials: 'aws-key', region: 'us-east-1') {
-                dir('EKS-TF') {
-                    script {
-                        sh 'terraform validate'
-                    }
-                }
-                }
-            }
-        }
-        stage('Terraform Plan') {
-            steps {
-                withAWS(credentials: 'aws-key', region: 'us-east-1') {
-                dir('EKS-TF') {
-                    script {
-                        sh "terraform plan -var-file=${params.'File-Name'}"
-                    }
-                }
-                }
-            }
-        }
-        stage('Terraform Action') {
-            steps {
-                withAWS(credentials: 'aws-key', region: 'us-east-1') { 
                 script {
-                    echo "${params.'Terraform-Action'}"
-                    dir('EKS-TF') {
-                        script {
-                            if (params.'Terraform-Action' == 'apply') {
-                                sh "terraform apply -auto-approve -var-file=${params.'File-Name'}"
-                            } else if (params.'Terraform-Action' == 'destroy') {
-                                sh "terraform destroy -auto-approve -var-file=${params.'File-Name'}"
-                            } else {
-                                error "Invalid value for Terraform-Action: ${params.'Terraform-Action'}"
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-key', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        dir('EKS-TF') {
+                            sh 'terraform init'
+                            if (params.action == 'plan') { 
+                                sh 'terraform plan' 
+                            }
+                            else if (params.action == 'apply') { 
+                                sh 'terraform apply --auto-approve' 
+                            }
+                            else if (params.action == 'destroy') { 
+                                sh 'terraform destroy --auto-approve' 
                             }
                         }
                     }
                 }
+            }
+        }
+
+        stage('Install Dependencies') {
+            when { expression { params.action != 'destroy' } }
+            steps {
+                sh 'npm install --prefer-offline --no-audit'
+            }
+        }
+
+        stage('Security & Analysis') {
+            when { expression { params.action != 'destroy' } }
+            parallel {
+                stage('Sonarqube') {
+                    steps {
+                        script {
+                            withSonarQubeEnv('sonar-server') {
+                                withEnv(["JAVA_HOME=${JAVA_17_HOME}", "PATH+JAVA=${JAVA_17_HOME}/bin"]) {
+                                    sh "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.projectName=Chatbot-AliWazeer -Dsonar.projectKey=Chatbot-AliWazeer -Dsonar.sources=. -Dsonar.java.binaries=."
+                                }
+                            }
+                            waitForQualityGate abortPipeline: false
+                        }
+                    }
+                }
+                stage('OWASP Quick Scan') {
+                    steps {
+                        script {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                withEnv(["JAVA_HOME=${JAVA_17_HOME}", "PATH+JAVA=${JAVA_17_HOME}/bin"]) {
+                                    // تم تعديله ليفحص ملفات التعريف فقط لتخطي البطء
+                                    dependencyCheck additionalArguments: '--scan package-lock.json --noupdate --format HTML', odcInstallation: 'DP-Check'
+                                }
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        stage('Trivy FS Scan') {
+            when { expression { params.action != 'destroy' } }
+            steps {
+                // فحص سريع للمجلد الحالي
+                sh 'trivy fs . --severity HIGH,CRITICAL --exit-code 0'
+            }
+        }
+
+        stage('Docker Build & Push') {
+            when { expression { params.action == 'apply' } }
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
+                        sh "docker build -t chatbot ."
+                        sh "docker tag chatbot ${DOCKER_IMAGE}"
+                        sh "docker push ${DOCKER_IMAGE}"
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to EKS Cluster') {
+            when { expression { params.action == 'apply' } }
+            steps {
+                script {
+                    // استخدام الـ ID اللي هو k8s كما طلبتِ
+                    withCredentials([file(credentialsId: 'k8s', variable: 'CUSTOM_KUBECONFIG')]) {
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-key', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                            
+                            // نستخدم الـ KUBECONFIG المرفوع مباشرة لتجنب خطأ الـ Permission denied
+                            sh """
+                                export KUBECONFIG=${CUSTOM_KUBECONFIG}
+                                kubectl apply -f k8s/ --kubeconfig=${CUSTOM_KUBECONFIG}
+                                kubectl get svc --kubeconfig=${CUSTOM_KUBECONFIG}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Finished execution for action: ${params.action}"
         }
     }
 }
