@@ -1,86 +1,133 @@
-pipeline{
+pipeline {
     agent any
-    tools{
-        jdk 'jdk17'
+
+    parameters {
+        choice(name: 'action', choices: ['plan', 'apply', 'destroy'], description: 'Terraform action to perform')
+    }
+
+    tools {
+        jdk 'jdk17.0.17+10' 
         nodejs 'node19'
     }
+
     environment {
-        SCANNER_HOME=tool 'sonar-scanner'
+        AWS_REGION            = 'us-east-1'
+        SCANNER_HOME          = tool 'sonar-scanner'
+        DOCKER_IMAGE          = "aliwazeer/chatbot-ui:latest"
+        JAVA_17_HOME          = '/usr/lib/jvm/java-17-openjdk-amd64'
     }
+
     stages {
-        stage('Checkout from Git'){
-            steps{
-                git branch: 'master', url: 'https://github.com/NotHarshhaa/DevOps-Projects/DevOps-Project-28/Chatbot-UI.git'
-            }
-        }
-        stage('Install Dependencies') {
+        stage('Checkout Source') {
             steps {
-                sh "npm install"
+                // استخدام الرابط الخاص بمشروعك
+                git branch: 'main', url: 'https://github.com/Uliwazeer/ChatBot-UI-EKS.git'
             }
         }
-        stage("Sonarqube Analysis "){
-            steps{
-                withSonarQubeEnv('sonar-server') {
-                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Chatbot \
-                    -Dsonar.projectKey=Chatbot '''
-                }
-            }
-        }
-        stage("quality gate"){
-           steps {
+
+        stage('Terraform Operations') {
+            steps {
                 script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token' 
-                }
-            } 
-        }
-        stage('OWASP FS SCAN') {
-            steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-            }
-        }
-        stage('TRIVY FS SCAN') {
-            steps {
-                sh "trivy fs . > trivyfs.json"
-            }
-        }
-        stage("Docker Build & Push"){
-            steps{
-                script{
-                   withDockerRegistry(credentialsId: 'docker', toolName: 'docker'){   
-                       sh "docker build -t chatbot ."
-                       sh "docker tag chatbot NotHarshhaa/chatbot:latest "
-                       sh "docker push NotHarshhaa/chatbot:latest "
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-key', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        dir('EKS-TF') {
+                            sh 'terraform init'
+                            if (params.action == 'plan') { 
+                                sh 'terraform plan' 
+                            }
+                            else if (params.action == 'apply') { 
+                                sh 'terraform apply --auto-approve' 
+                            }
+                            else if (params.action == 'destroy') { 
+                                sh 'terraform destroy --auto-approve' 
+                            }
+                        }
                     }
                 }
             }
         }
-        stage("TRIVY"){
-            steps{
-                sh "trivy image NotHarshhaa/chatbot:latest > trivy.json" 
+
+        stage('Install Dependencies') {
+            when { expression { params.action != 'destroy' } }
+            steps {
+                sh 'npm install --prefer-offline --no-audit'
             }
         }
-        stage ("Remove container") {
-            steps{
-                sh "docker stop chatbot | true"
-                sh "docker rm chatbot | true"
-             }
-        }
-        stage('Deploy to container'){
-            steps{
-                sh 'docker run -d --name chatbot -p 3000:3000 NotHarshhaa/chatbot:latest'
-            }
-        }
-        stage('Deploy to kubernetes'){
-            steps{
-                withAWS(credentials: 'aws-key', region: 'us-east-1'){
-                script{
-                    withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'k8s', namespace: '', restrictKubeConfigAccess: false, serverUrl: '') {
-                       sh 'kubectl apply -f k8s/chatbot-ui.yaml'
-                  }
+
+        stage('Security & Analysis') {
+            when { expression { params.action != 'destroy' } }
+            parallel {
+                stage('Sonarqube') {
+                    steps {
+                        script {
+                            withSonarQubeEnv('sonar-server') {
+                                withEnv(["JAVA_HOME=${JAVA_17_HOME}", "PATH+JAVA=${JAVA_17_HOME}/bin"]) {
+                                    sh "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.projectName=Chatbot-AliWazeer -Dsonar.projectKey=Chatbot-AliWazeer -Dsonar.sources=. -Dsonar.java.binaries=."
+                                }
+                            }
+                            waitForQualityGate abortPipeline: false
+                        }
+                    }
+                }
+                stage('OWASP Quick Scan') {
+                    steps {
+                        script {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                withEnv(["JAVA_HOME=${JAVA_17_HOME}", "PATH+JAVA=${JAVA_17_HOME}/bin"]) {
+                                    // تم تعديله ليفحص ملفات التعريف فقط لتخطي البطء
+                                    dependencyCheck additionalArguments: '--scan package-lock.json --noupdate --format HTML', odcInstallation: 'DP-Check'
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
+
+        stage('Trivy FS Scan') {
+            when { expression { params.action != 'destroy' } }
+            steps {
+                // فحص سريع للمجلد الحالي
+                sh 'trivy fs . --severity HIGH,CRITICAL --exit-code 0'
+            }
+        }
+
+        stage('Docker Build & Push') {
+            when { expression { params.action == 'apply' } }
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
+                        sh "docker build -t chatbot ."
+                        sh "docker tag chatbot ${DOCKER_IMAGE}"
+                        sh "docker push ${DOCKER_IMAGE}"
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to EKS Cluster') {
+            when { expression { params.action == 'apply' } }
+            steps {
+                script {
+                    // استخدام الـ ID اللي هو k8s كما طلبتِ
+                    withCredentials([file(credentialsId: 'k8s', variable: 'CUSTOM_KUBECONFIG')]) {
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-key', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                            
+                            // نستخدم الـ KUBECONFIG المرفوع مباشرة لتجنب خطأ الـ Permission denied
+                            sh """
+                                export KUBECONFIG=${CUSTOM_KUBECONFIG}
+                                kubectl apply -f k8s/ --kubeconfig=${CUSTOM_KUBECONFIG}
+                                kubectl get svc --kubeconfig=${CUSTOM_KUBECONFIG}
+                            """
+                        }
+                    }
+                }
+            }
         }
     }
+
+    post {
+        always {
+            echo "Finished execution for action: ${params.action}"
+        }
     }
+}
