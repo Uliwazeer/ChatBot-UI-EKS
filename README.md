@@ -1,5 +1,8 @@
-# AI-Powered DevSecOps Pipeline: ChatBot UI Deployment on AWS EKS.   
-<img width="2960" height="1247" alt="ChatBot-UI" src="https://github.com/user-attachments/assets/e69c4c5c-fd54-4ced-b22f-8d4558407334" />
+# AI-Powered DevSecOps Pipeline: ChatBot UI Deployment on AWS EKS.  
+
+<img width="1536" height="672" alt="chatbot-ui" src="https://github.com/user-attachments/assets/ac0ed7f6-0f39-4600-a5c4-31f9dc076705" />
+
+
 
 
 ## 📋 Table of Contents
