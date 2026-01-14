@@ -1,34 +1,29 @@
+# البحث باستخدام الـ ID مباشرة لأن الـ Tags عندك بـ None
 data "aws_vpc" "vpc" {
-  filter {
-    name   = "tag:Name"
-    values = [var.vpc-name]
-  }
+  id = var.vpc-name 
 }
 
 data "aws_internet_gateway" "igw" {
   filter {
-    name   = "tag:Name"
+    name   = "internet-gateway-id"
     values = [var.igw-name]
   }
 }
 
 data "aws_subnet" "subnet" {
-  filter {
-    name   = "tag:Name"
-    values = [var.subnet-name]
-  }
+  id = var.subnet-name
 }
 
+# هنا بنستخدم اسم الـ Security Group (default أو launch-wizard-1)
 data "aws_security_group" "sg-default" {
-  filter {
-    name   = "tag:Name"
-    values = [var.security-group-name]
-  }
+  vpc_id = data.aws_vpc.vpc.id
+  name   = var.security-group-name 
 }
 
+# ده هيفضل زي ما هو لأنه بيكاريت سابنت جديدة
 resource "aws_subnet" "public-subnet2" {
   vpc_id                  = data.aws_vpc.vpc.id
-  cidr_block              = "10.0.2.0/24"
+  cidr_block              = "172.31.96.0/20" # خلي بالك: الـ Default VPC CIDR عادة بيكون 172.31.0.0/16
   availability_zone       = "us-east-1b"
   map_public_ip_on_launch = true
 
